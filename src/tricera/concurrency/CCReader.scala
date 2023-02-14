@@ -2998,635 +2998,657 @@ class CCReader private (prog : Program,
       }
     }
 
-    private def evalHelp(exp : Exp) : Unit = exp match {
-      case exp : Ecomma => {
-        evalHelp(exp.exp_1)
-        popVal
-        maybeOutputClause
-        evalHelp(exp.exp_2)
-      }
-      case exp : Eassign if (exp.assignment_op_.isInstanceOf[Assign] &&
-                             isClockVariable(exp.exp_1)) => {
-        evalHelp(exp.exp_2)
-        maybeOutputClause
-        setValue(asLValue(exp.exp_1), translateClockValue(topVal))
-      }
-      case exp : Eassign if (exp.assignment_op_.isInstanceOf[Assign] &&
-                             isDurationVariable(exp.exp_1)) => {
-        evalHelp(exp.exp_2)
-        maybeOutputClause
-        setValue(asLValue(exp.exp_1), translateDurationValue(topVal))
-      }
-      case exp : Eassign if exp.assignment_op_.isInstanceOf[Assign] => {
-        // if lhs is array pointer, an alloc rhs evaluation should produce an
-        // AddressRange even if the allocation size is only 1.
-        evalHelp(exp.exp_2) //first evaluate rhs and push
-        maybeOutputClause
-        val rhsVal = popVal
-        val lhsVal = eval(exp.exp_1) //then evaluate lhs and get it
-        val updatingPointedValue =
-          isHeapRead(lhsVal) || // *(p) = ... where p is a heap ptr
-          isHeapStructFieldRead(lhsVal) // ps->f = ... where ps is a heap ptr
-        val lhsIsArraySelect =
-          lhsVal.toTerm match {
-            case IFunApp(ExtArray.Select(_), _) => true
-            case _ => false
-          }
-        if(lhsIsArrayPointer || isHeapPointer(lhsVal) || updatingPointedValue ||
-          lhsIsArraySelect) {
-          if (updatingPointedValue)
-            heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], rhsVal, true, true)
-          else if (lhsIsArraySelect) { // todo: this branch needs to be rewritten, it was hastily coded to deal with arrays inside structs.
-            val newTerm = CCTerm(
-              writeADT(lhsVal.toTerm.asInstanceOf[IFunApp],
-                         rhsVal.toTerm, heap.userADTCtors, heap.userADTSels),
-                       lhsVal.typ, rhsVal.srcInfo)
-            val lhsName = asLValue(exp.exp_1)
-            val oldLhsVal = getValue(lhsName)
-            val innerTerm = lhsVal.toTerm.asInstanceOf[IFunApp].args.head
-            val actualLhsTerm = getActualAssignedTerm(
-              CCTerm(innerTerm, oldLhsVal.typ, rhsVal.srcInfo), newTerm)
-            setValue(asLValue(exp.exp_1), actualLhsTerm)
+    private def evalHelp(exp : Exp) : Unit = evalHelpInner(exp)
+
+    // evalHelpInner returns metadata about the evaluation
+    // currently: returns true iff function designator was converted to pointer
+    private def evalHelpInner(exp : Exp) : Boolean = {
+      var convertedFunctionDesignator = false
+
+      exp match {
+        case exp : Ecomma => {
+          evalHelp(exp.exp_1)
+          popVal
+          maybeOutputClause
+          evalHelp(exp.exp_2)
+        }
+        case exp : Eassign if (exp.assignment_op_.isInstanceOf[Assign] &&
+          isClockVariable(exp.exp_1)) => {
+          evalHelp(exp.exp_2)
+          maybeOutputClause
+          setValue(asLValue(exp.exp_1), translateClockValue(topVal))
+        }
+        case exp : Eassign if (exp.assignment_op_.isInstanceOf[Assign] &&
+          isDurationVariable(exp.exp_1)) => {
+          evalHelp(exp.exp_2)
+          maybeOutputClause
+          setValue(asLValue(exp.exp_1), translateDurationValue(topVal))
+        }
+        case exp : Eassign if exp.assignment_op_.isInstanceOf[Assign] => {
+          // if lhs is array pointer, an alloc rhs evaluation should produce an
+          // AddressRange even if the allocation size is only 1.
+          evalHelp(exp.exp_2) //first evaluate rhs and push
+          maybeOutputClause
+          val rhsVal = popVal
+          val lhsVal = eval(exp.exp_1) //then evaluate lhs and get it
+          val updatingPointedValue =
+            isHeapRead(lhsVal) || // *(p) = ... where p is a heap ptr
+              isHeapStructFieldRead(lhsVal) // ps->f = ... where ps is a heap ptr
+          val lhsIsArraySelect =
+            lhsVal.toTerm match {
+              case IFunApp(ExtArray.Select(_), _) => true
+              case _ => false
+            }
+          if(lhsIsArrayPointer || isHeapPointer(lhsVal) || updatingPointedValue ||
+            lhsIsArraySelect) {
+            if (updatingPointedValue)
+              heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], rhsVal, true, true)
+            else if (lhsIsArraySelect) { // todo: this branch needs to be rewritten, it was hastily coded to deal with arrays inside structs.
+              val newTerm = CCTerm(
+                writeADT(lhsVal.toTerm.asInstanceOf[IFunApp],
+                  rhsVal.toTerm, heap.userADTCtors, heap.userADTSels),
+                lhsVal.typ, rhsVal.srcInfo)
+              val lhsName = asLValue(exp.exp_1)
+              val oldLhsVal = getValue(lhsName)
+              val innerTerm = lhsVal.toTerm.asInstanceOf[IFunApp].args.head
+              val actualLhsTerm = getActualAssignedTerm(
+                CCTerm(innerTerm, oldLhsVal.typ, rhsVal.srcInfo), newTerm)
+              setValue(asLValue(exp.exp_1), actualLhsTerm)
+            } else {
+              val lhsName = asLValue(exp.exp_1)
+              val actualRhsVal = rhsVal.toTerm match {
+                case lit : IIntLit =>
+                  if (lit.value.intValue != 0) {
+                    throw new TranslationException("Pointer arithmetic is not " +
+                      "allowed, and the only assignable integer value for " +
+                      "pointers is 0 (NULL)")
+                  } else CCTerm(heap.nullAddr(), CCHeapPointer(heap, lhsVal.typ), rhsVal.srcInfo)
+                case _ => rhsVal
+              }
+              val actualLhsTerm = getActualAssignedTerm(lhsVal, actualRhsVal)
+              rhsVal.typ match {
+                case arrayPtr1 : CCHeapArrayPointer =>
+                  lhsVal.typ match {
+                    case _ : CCHeapPointer =>
+                      throw new TranslationException(getLineString(exp) +
+                        "Cannot assign an array value to " + lhsName + ". " +
+                        "Declaring " + lhsName + " as " + lhsName + "[] might " +
+                        "solve this issue.")
+                    case arrayPtr2 : CCHeapArrayPointer =>
+                      if (arrayPtr1 != arrayPtr2) {
+                        if (arrayPtr1.arrayType == StackArray &&
+                          arrayPtr2.arrayType == HeapArray) // -> alloca
+                          updateVarType(lhsName, arrayPtr1) // todo: replace with a static analysis? we should detect arrays on stack beforehand maybe?
+                        else throw new TranslationException(getLineString(exp) +
+                          "Unsupported operation: pointer " + lhsName +
+                          " points to elements of multiple arrays (or array types)." +
+                          "Try initialising the array directly.")
+                      }
+                    case _ => // nothing
+                  }
+                case _ => // nothing
+              }
+              setValue(lhsName, actualLhsTerm)
+            }
           } else {
             val lhsName = asLValue(exp.exp_1)
-            val actualRhsVal = rhsVal.toTerm match {
-              case lit : IIntLit =>
-                if (lit.value.intValue != 0) {
-                  throw new TranslationException("Pointer arithmetic is not " +
-                    "allowed, and the only assignable integer value for " +
-                    "pointers is 0 (NULL)")
-                } else CCTerm(heap.nullAddr(), CCHeapPointer(heap, lhsVal.typ), rhsVal.srcInfo)
-              case _ => rhsVal
-            }
-            val actualLhsTerm = getActualAssignedTerm(lhsVal, actualRhsVal)
-            rhsVal.typ match {
-              case arrayPtr1 : CCHeapArrayPointer =>
-                lhsVal.typ match {
-                  case _ : CCHeapPointer =>
-                    throw new TranslationException(getLineString(exp) +
-                      "Cannot assign an array value to " + lhsName + ". " +
-                      "Declaring " + lhsName + " as " + lhsName + "[] might " +
-                      "solve this issue.")
-                  case arrayPtr2 : CCHeapArrayPointer =>
-                    if (arrayPtr1 != arrayPtr2) {
-                      if (arrayPtr1.arrayType == StackArray &&
-                          arrayPtr2.arrayType == HeapArray) // -> alloca
-                        updateVarType(lhsName, arrayPtr1) // todo: replace with a static analysis? we should detect arrays on stack beforehand maybe?
-                      else throw new TranslationException(getLineString(exp) +
-                        "Unsupported operation: pointer " + lhsName +
-                        " points to elements of multiple arrays (or array types)." +
-                        "Try initialising the array directly.")
-                    }
-                  case _ => // nothing
-                }
-              case _ => // nothing
-            }
+            val actualLhsTerm = getActualAssignedTerm(lhsVal, rhsVal)
             setValue(lhsName, actualLhsTerm)
           }
-        } else {
-          val lhsName = asLValue(exp.exp_1)
-          val actualLhsTerm = getActualAssignedTerm(lhsVal, rhsVal)
-          setValue(lhsName, actualLhsTerm)
+          pushVal(rhsVal)
         }
-        pushVal(rhsVal)
-      }
-      case exp : Eassign => {
-        evalHelp(exp.exp_1)
-        val lhsVal = topVal
-        maybeOutputClause
-        evalHelp(exp.exp_2)
-        maybeOutputClause
-        val rhsE = popVal
-        val rhs = rhsE.toTerm
-        val lhsE = popVal
-        val lhs = lhsE.toTerm
-        if (lhsE.typ.isInstanceOf[CCClock] || lhsE.typ.isInstanceOf[CCDuration])
-          throw new TranslationException("unsupported assignment to clock")
-        val newVal = CCTerm(lhsE.typ cast (exp.assignment_op_ match {
-          case _ : AssignMul =>
-            ap.theories.nia.GroebnerMultiplication.mult(lhs, rhs)
-          case _ : AssignDiv =>
-            ap.theories.nia.GroebnerMultiplication.tDiv(lhs, rhs)
-          case _ : AssignMod =>
-            ap.theories.nia.GroebnerMultiplication.tMod(lhs, rhs)
-          case _ : AssignAdd =>
-            (lhsE.typ, rhsE.typ) match {
-              case (_ : CCHeapArrayPointer, _ : CCArithType) =>
-                addToAddressRangeStart(lhs, rhs)
-              case _ => lhs + rhs
-            }
-          case _ : AssignSub =>
-            (lhsE.typ, rhsE.typ) match {
-              case (arrType : CCHeapArrayPointer, _ : CCArithType) =>
-                throw new TranslationException("Only addition is allowed in " +
-                  "array pointer arithmetic.") // due to how AddressRange is defined: <startAddr, size>
+        case exp : Eassign => {
+          evalHelp(exp.exp_1)
+          val lhsVal = topVal
+          maybeOutputClause
+          evalHelp(exp.exp_2)
+          maybeOutputClause
+          val rhsE = popVal
+          val rhs = rhsE.toTerm
+          val lhsE = popVal
+          val lhs = lhsE.toTerm
+          if (lhsE.typ.isInstanceOf[CCClock] || lhsE.typ.isInstanceOf[CCDuration])
+            throw new TranslationException("unsupported assignment to clock")
+          val newVal = CCTerm(lhsE.typ cast (exp.assignment_op_ match {
+            case _ : AssignMul =>
+              ap.theories.nia.GroebnerMultiplication.mult(lhs, rhs)
+            case _ : AssignDiv =>
+              ap.theories.nia.GroebnerMultiplication.tDiv(lhs, rhs)
+            case _ : AssignMod =>
+              ap.theories.nia.GroebnerMultiplication.tMod(lhs, rhs)
+            case _ : AssignAdd =>
+              (lhsE.typ, rhsE.typ) match {
+                case (_ : CCHeapArrayPointer, _ : CCArithType) =>
+                  addToAddressRangeStart(lhs, rhs)
+                case _ => lhs + rhs
+              }
+            case _ : AssignSub =>
+              (lhsE.typ, rhsE.typ) match {
+                case (arrType : CCHeapArrayPointer, _ : CCArithType) =>
+                  throw new TranslationException("Only addition is allowed in " +
+                    "array pointer arithmetic.") // due to how AddressRange is defined: <startAddr, size>
                 //addToAddressRangeStart(lhsE, rhsE, arrType, _ - _).toTerm
-              case _ => lhs - rhs
-            }
-          case _ : AssignLeft =>
-            ModuloArithmetic.bvshl(lhsE.typ cast2Unsigned lhs,
-              lhsE.typ cast2Unsigned rhs)
-          case _ : AssignRight =>
-            ModuloArithmetic.bvashr(lhsE.typ cast2Unsigned lhs,
-              lhsE.typ cast2Unsigned rhs)
-          case _ : AssignAnd =>
-            ModuloArithmetic.bvand(lhsE.typ cast2Unsigned lhs,
-              lhsE.typ cast2Unsigned rhs)
-          case _ : AssignXor =>
-            ModuloArithmetic.bvxor(lhsE.typ cast2Unsigned lhs,
-              lhsE.typ cast2Unsigned rhs)
-          case _ : AssignOr =>
-            ModuloArithmetic.bvand(lhsE.typ cast2Unsigned lhs,
-              lhsE.typ cast2Unsigned rhs)
-        }), lhsE.typ, lhsE.srcInfo)
-        pushVal(newVal)
+                case _ => lhs - rhs
+              }
+            case _ : AssignLeft =>
+              ModuloArithmetic.bvshl(lhsE.typ cast2Unsigned lhs,
+                lhsE.typ cast2Unsigned rhs)
+            case _ : AssignRight =>
+              ModuloArithmetic.bvashr(lhsE.typ cast2Unsigned lhs,
+                lhsE.typ cast2Unsigned rhs)
+            case _ : AssignAnd =>
+              ModuloArithmetic.bvand(lhsE.typ cast2Unsigned lhs,
+                lhsE.typ cast2Unsigned rhs)
+            case _ : AssignXor =>
+              ModuloArithmetic.bvxor(lhsE.typ cast2Unsigned lhs,
+                lhsE.typ cast2Unsigned rhs)
+            case _ : AssignOr =>
+              ModuloArithmetic.bvand(lhsE.typ cast2Unsigned lhs,
+                lhsE.typ cast2Unsigned rhs)
+          }), lhsE.typ, lhsE.srcInfo)
+          pushVal(newVal)
 
-        val updatingPointedValue =
-          isHeapRead(lhsVal) || // *(p) = ... where p is a heap ptr
-            isHeapStructFieldRead(lhsVal) // ps->f = ... where ps is a heap ptr
+          val updatingPointedValue =
+            isHeapRead(lhsVal) || // *(p) = ... where p is a heap ptr
+              isHeapStructFieldRead(lhsVal) // ps->f = ... where ps is a heap ptr
 
-        if(isHeapPointer(exp) && updatingPointedValue) {
-          heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], newVal, true, true)
-        } else {
-          setValue(lookupVar(asLValue(exp.exp_1)),
-            getActualAssignedTerm(lhsVal, newVal),
-            isIndirection(exp.exp_1)) // todo get rid of indirections?
+          if(isHeapPointer(exp) && updatingPointedValue) {
+            heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], newVal, true, true)
+          } else {
+            setValue(lookupVar(asLValue(exp.exp_1)),
+              getActualAssignedTerm(lhsVal, newVal),
+              isIndirection(exp.exp_1)) // todo get rid of indirections?
+          }
         }
-      }
-      case exp : Econdition => {
-        val cond = eval(exp.exp_1).toFormula
+        case exp : Econdition => {
+          val cond = eval(exp.exp_1).toFormula
 
-        saveState
-        addGuard(cond)
-        evalHelp(exp.exp_2)
-        outputClause
-        val intermediatePred = initPred
-
-        restoreState
-        addGuard(~cond)
-        evalHelp(exp.exp_3)
-        outputClause(intermediatePred)
-      }
-      case exp : Elor => {
-        evalHelp(exp.exp_1)
-        maybeOutputClause
-        val cond = popVal.toFormula
-
-        saveState
-        addGuard(~cond)
-        val newGuard = guard
-        evalHelp(exp.exp_2)
-        maybeOutputClause
-
-        // check whether the second expression had side-effects
-        if ((guard eq newGuard) && atomValuesUnchanged) {
-          val cond2 = popVal.toFormula
-          restoreState
-          pushVal(CCFormula(cond ||| cond2, CCInt(),
-            Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
-        } else {
-          outputClause
-          val intermediatePred = initPred
-
-          restoreState
+          saveState
           addGuard(cond)
-          pushVal(CCFormula(true, CCInt(),
-            Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
-          outputClause(intermediatePred)
-        }
-      }
-      case exp : Eland => {
-        evalHelp(exp.exp_1)
-        maybeOutputClause
-        val cond = popVal.toFormula
-
-        saveState
-        addGuard(cond)
-        val newGuard = guard
-        evalHelp(exp.exp_2)
-        maybeOutputClause
-
-        // check whether the second expression had side-effects
-        if ((guard eq newGuard) && atomValuesUnchanged) {
-          val cond2 = popVal.toFormula
-          restoreState
-          pushVal(CCFormula(cond &&& cond2, CCInt(),
-            Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
-        } else {
+          evalHelp(exp.exp_2)
           outputClause
           val intermediatePred = initPred
 
           restoreState
           addGuard(~cond)
-          pushVal(CCFormula(false, CCInt(),
-            Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
+          evalHelp(exp.exp_3)
           outputClause(intermediatePred)
         }
-      }
-      case exp : Ebitor =>
-        strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvor(_, _))
-      case exp : Ebitexor =>
-        strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvxor(_, _))
-      case exp : Ebitand =>
-        strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvand(_, _))
-      case exp : Eeq =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ === _)
-      case exp : Eneq =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ =/= _)
-      case exp : Elthen =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ < _)
-      case exp : Egrthen =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ > _)
-      case exp : Ele =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ <= _)
-      case exp : Ege =>
-        strictBinPred(exp.exp_1, exp.exp_2, _ >= _)
-      case exp : Eleft =>
-        strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvshl(_, _))
-      case exp : Eright =>
-        strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvashr(_, _))
-      case exp : Eplus =>
-        strictBinFun(exp.exp_1, exp.exp_2, _ + _, opIsAddition = true)
-      case exp : Eminus =>
-        strictBinFun(exp.exp_1, exp.exp_2, _ - _)
-      case exp : Etimes =>
-        strictBinFun(exp.exp_1, exp.exp_2, {
-          (x : ITerm, y : ITerm) =>
-            ap.theories.nia.GroebnerMultiplication.mult(x, y)
-        })
-      case exp : Ediv =>
-        strictBinFun(exp.exp_1, exp.exp_2, {
-          (x : ITerm, y : ITerm) =>
-            ap.theories.nia.GroebnerMultiplication.tDiv(x, y)
-        })
-      case exp : Emod =>
-        strictBinFun(exp.exp_1, exp.exp_2, {
-          (x : ITerm, y : ITerm) =>
-            ap.theories.nia.GroebnerMultiplication.tMod(x, y)
-        })
-      case exp : Etypeconv => {
-        evalHelp(exp.exp_)
-        pushVal(convertType(popVal, getType(exp.type_name_)))
-      }
-      case _ : Epreinc | _ : Epredec =>
-        val (preExp, op) = exp match {
-          case exp : Epreinc => (exp.exp_, +1)
-          case exp : Epredec => (exp.exp_, -1)
+        case exp : Elor => {
+          evalHelp(exp.exp_1)
+          maybeOutputClause
+          val cond = popVal.toFormula
+
+          saveState
+          addGuard(~cond)
+          val newGuard = guard
+          evalHelp(exp.exp_2)
+          maybeOutputClause
+
+          // check whether the second expression had side-effects
+          if ((guard eq newGuard) && atomValuesUnchanged) {
+            val cond2 = popVal.toFormula
+            restoreState
+            pushVal(CCFormula(cond ||| cond2, CCInt(),
+              Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
+          } else {
+            outputClause
+            val intermediatePred = initPred
+
+            restoreState
+            addGuard(cond)
+            pushVal(CCFormula(true, CCInt(),
+              Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
+            outputClause(intermediatePred)
+          }
         }
-        evalHelp(preExp)
-        val lhsVal = topVal // todo : check if necessary, maybe just use topVal?
-        maybeOutputClause
-        pushVal(popVal mapTerm (_ + op))
-        if(isHeapPointer(preExp)) {
-          heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], topVal, true, true)
-        } else {
-          setValue(lookupVar(asLValue(preExp)),
-            getActualAssignedTerm(lhsVal, topVal),
-            isIndirection(preExp)) // todo get rid of indirection?
+        case exp : Eland => {
+          evalHelp(exp.exp_1)
+          maybeOutputClause
+          val cond = popVal.toFormula
+
+          saveState
+          addGuard(cond)
+          val newGuard = guard
+          evalHelp(exp.exp_2)
+          maybeOutputClause
+
+          // check whether the second expression had side-effects
+          if ((guard eq newGuard) && atomValuesUnchanged) {
+            val cond2 = popVal.toFormula
+            restoreState
+            pushVal(CCFormula(cond &&& cond2, CCInt(),
+              Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
+          } else {
+            outputClause
+            val intermediatePred = initPred
+
+            restoreState
+            addGuard(~cond)
+            pushVal(CCFormula(false, CCInt(),
+              Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))))
+            outputClause(intermediatePred)
+          }
         }
-      case exp : Epreop => {
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        evalHelp(exp.exp_)
-        exp.unary_operator_ match {
-          case _ : Address    =>
-            topVal.toTerm match {
-              case fieldFun: IFunApp
-                if !(objectGetters contains fieldFun.fun) &&
-                   (heap.userADTSels exists(_ contains fieldFun.fun)) => // an ADT
-                val (fieldNames, rootTerm) = getFieldInfo(fieldFun)
-                rootTerm match {
-                  case Left(c) =>
-                    val rootInd: Int = lookupVar(c.name)
-                    val structType = getValue(rootInd, false).typ.asInstanceOf[CCStruct]
-                    assert(rootInd > -1 && rootInd < values.size - 1) // todo
-                    val ptr = CCStackPointer(rootInd, popVal.typ, structType.getFieldAddress(fieldNames))
-                    pushVal(CCTerm(IExpression.Int2ITerm(rootInd), ptr, srcInfo)) //we don't care about the value
-                  case Right(c) =>
-                    // newAddr(alloc(h, WrappedAddr(getPtrField(getStruct(read(h, p))))))
-                    // here topVal = getPtrField(getStruct(read(h, p))), we construct the rest
-                    // this is to allocate memory for expressions like:
-                    // &((*p)->tail)
-                    // alternatively one could rewrite this using a temporary variable
-                    // and create a stack pointer to it (but this needs to be done during preprocessing,
-                    //otherwise when we evaluate this we would be pushing two terms instead of one)
+        case exp : Ebitor =>
+          strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvor(_, _))
+        case exp : Ebitexor =>
+          strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvxor(_, _))
+        case exp : Ebitand =>
+          strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvand(_, _))
+        case exp : Eeq =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ === _)
+        case exp : Eneq =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ =/= _)
+        case exp : Elthen =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ < _)
+        case exp : Egrthen =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ > _)
+        case exp : Ele =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ <= _)
+        case exp : Ege =>
+          strictBinPred(exp.exp_1, exp.exp_2, _ >= _)
+        case exp : Eleft =>
+          strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvshl(_, _))
+        case exp : Eright =>
+          strictUnsignedBinFun(exp.exp_1, exp.exp_2, ModuloArithmetic.bvashr(_, _))
+        case exp : Eplus =>
+          strictBinFun(exp.exp_1, exp.exp_2, _ + _, opIsAddition = true)
+        case exp : Eminus =>
+          strictBinFun(exp.exp_1, exp.exp_2, _ - _)
+        case exp : Etimes =>
+          strictBinFun(exp.exp_1, exp.exp_2, {
+            (x : ITerm, y : ITerm) =>
+              ap.theories.nia.GroebnerMultiplication.mult(x, y)
+          })
+        case exp : Ediv =>
+          strictBinFun(exp.exp_1, exp.exp_2, {
+            (x : ITerm, y : ITerm) =>
+              ap.theories.nia.GroebnerMultiplication.tDiv(x, y)
+          })
+        case exp : Emod =>
+          strictBinFun(exp.exp_1, exp.exp_2, {
+            (x : ITerm, y : ITerm) =>
+              ap.theories.nia.GroebnerMultiplication.tMod(x, y)
+          })
+        case exp : Etypeconv => {
+          evalHelp(exp.exp_)
+          pushVal(convertType(popVal, getType(exp.type_name_)))
+        }
+        case _ : Epreinc | _ : Epredec =>
+          val (preExp, op) = exp match {
+            case exp : Epreinc => (exp.exp_, +1)
+            case exp : Epredec => (exp.exp_, -1)
+          }
+          evalHelp(preExp)
+          val lhsVal = topVal // todo : check if necessary, maybe just use topVal?
+          maybeOutputClause
+          pushVal(popVal mapTerm (_ + op))
+          if(isHeapPointer(preExp)) {
+            heapWrite(lhsVal.toTerm.asInstanceOf[IFunApp], topVal, true, true)
+          } else {
+            setValue(lookupVar(asLValue(preExp)),
+              getActualAssignedTerm(lhsVal, topVal),
+              isIndirection(preExp)) // todo get rid of indirection?
+          }
+        case exp : Epreop => {
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          val evaluationConvertedFunctionDesignator = evalHelpInner(exp.exp_)
+          exp.unary_operator_ match {
+            case _ : Address    =>
+              topVal.toTerm match {
+                case fieldFun: IFunApp
+                  if !(objectGetters contains fieldFun.fun) &&
+                    (heap.userADTSels exists(_ contains fieldFun.fun)) => // an ADT
+                  val (fieldNames, rootTerm) = getFieldInfo(fieldFun)
+                  rootTerm match {
+                    case Left(c) =>
+                      val rootInd: Int = lookupVar(c.name)
+                      val structType = getValue(rootInd, false).typ.asInstanceOf[CCStruct]
+                      assert(rootInd > -1 && rootInd < values.size - 1) // todo
+                      val ptr = CCStackPointer(rootInd, popVal.typ, structType.getFieldAddress(fieldNames))
+                      pushVal(CCTerm(IExpression.Int2ITerm(rootInd), ptr, srcInfo)) //we don't care about the value
+                    case Right(c) =>
+                      // newAddr(alloc(h, WrappedAddr(getPtrField(getStruct(read(h, p))))))
+                      // here topVal = getPtrField(getStruct(read(h, p))), we construct the rest
+                      // this is to allocate memory for expressions like:
+                      // &((*p)->tail)
+                      // alternatively one could rewrite this using a temporary variable
+                      // and create a stack pointer to it (but this needs to be done during preprocessing,
+                      //otherwise when we evaluate this we would be pushing two terms instead of one)
+                      val newTerm = heapAlloc(popVal.asInstanceOf[CCTerm])
+                      maybeOutputClause
+                      assert(c.args.size == 1)
+                      val readObj = c.args.head
+                      val resSort = c.fun.asInstanceOf[MonoSortedIFunction].resSort
+                      addGuard(heap.heapADTs.hasCtor(readObj, sortCtorIdMap(resSort)))
+                      pushVal(newTerm)
+                  }
+                case f : IFunApp if objectGetters contains f.fun => // a heap read (might also be from a heap array)
+                  val readFunApp = f.args.head.asInstanceOf[IFunApp] // sth like read(h, ...)
+                  val Seq(heapTerm, addrTerm) = readFunApp.args
+                  // todo: below type extraction is not safe!
+                  val t = addrTerm match {
+                    case IFunApp(heap.nth, args) => // if nthAddrRange(a, i)
+                      val Seq(arrTerm, indTerm) = args
+                      // return the addressRange starting from i
+                      CCTerm(addToAddressRangeStart(arrTerm, indTerm),
+                        getValue(arrTerm.asInstanceOf[IConstant].c.name).typ, srcInfo
+                      )
+                    case _ =>
+                      CCTerm(addrTerm, CCHeapPointer(heap,
+                        getValue(addrTerm.asInstanceOf[IConstant].c.name).typ), srcInfo)
+                  }
+                  popVal
+                  pushVal(t)
+
+                case _ if (topVal.typ.isInstanceOf[CCFunctionPointer] && evaluationConvertedFunctionDesignator) =>
+                // do nothing, the conversion has already been done
+                case _ =>
+                  val t = if (handlingFunContractArgs) {
                     val newTerm = heapAlloc(popVal.asInstanceOf[CCTerm])
                     maybeOutputClause
-                    assert(c.args.size == 1)
-                    val readObj = c.args.head
-                    val resSort = c.fun.asInstanceOf[MonoSortedIFunction].resSort
-                    addGuard(heap.heapADTs.hasCtor(readObj, sortCtorIdMap(resSort)))
-                    pushVal(newTerm)
-                }
-              case f : IFunApp if objectGetters contains f.fun => // a heap read (might also be from a heap array)
-                val readFunApp = f.args.head.asInstanceOf[IFunApp] // sth like read(h, ...)
-                val Seq(heapTerm, addrTerm) = readFunApp.args
-                // todo: below type extraction is not safe!
-                val t = addrTerm match {
-                  case IFunApp(heap.nth, args) => // if nthAddrRange(a, i)
-                    val Seq(arrTerm, indTerm) = args
-                    // return the addressRange starting from i
-                    CCTerm(addToAddressRangeStart(arrTerm, indTerm),
-                      getValue(arrTerm.asInstanceOf[IConstant].c.name).typ, srcInfo
-                    )
-                  case _ =>
-                    CCTerm(addrTerm, CCHeapPointer(heap,
-                      getValue(addrTerm.asInstanceOf[IConstant].c.name).typ), srcInfo)
-                }
-                popVal
-                pushVal(t)
-
-              case _ =>
-                val t = if (handlingFunContractArgs) {
-                  val newTerm = heapAlloc(popVal.asInstanceOf[CCTerm])
-                  maybeOutputClause
-                  newTerm
-                } else {
-                  val ind = values.indexWhere(v => v == topVal)
-                  assert(ind > -1 && ind < values.size - 1) // todo
-                  val ptr = CCStackPointer(ind, popVal.typ, Nil)
-                  CCTerm(IExpression.Int2ITerm(ind), ptr, srcInfo)
-                }
-                pushVal(t) //we don't care about the value
-            }
-          case _ : Indirection =>
-            val v = popVal
-            v.typ match { // todo: type checking?
-              case ptr : CCStackPointer => pushVal(getPointedTerm(ptr))
-              case   _ : CCHeapPointer =>
-                if(evaluatingLhs) pushVal(v)
-                else pushVal(heapRead(v))
-              case  arr : CCHeapArrayPointer =>
-                if(evaluatingLhs) pushVal(v)
-                else pushVal(heapArrayRead(v, CCTerm(IIntLit(0), CCInt(), srcInfo), arr))
-              case _ => throw new TranslationException("Cannot dereference " +
-                  "non-pointer: " + v.typ + " " + v.toTerm)
-            }
-          case _ : Plus       => // nothing
-          case _ : Negative   =>
-            val t = popVal mapTerm (-(_))
-            pushVal(CCTerm(t.toTerm, t.typ, srcInfo))
-//          case _ : Complement.  Unary_operator ::= "~" ;
-          case _ : Logicalneg =>
-            pushVal(CCFormula(~popVal.toFormula, CCInt(), srcInfo))
-        }
-      }
-//      case exp : Ebytesexpr.  Exp15 ::= "sizeof" Exp15;
-//      case exp : Ebytestype.  Exp15 ::= "sizeof" "(" Type_name ")";
-//      case exp : Earray.      Exp16 ::= Exp16 "[" Exp "]" ;
-
-      case exp : Efunk => {
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        // inline the called function
-        printer print exp.exp_ match {
-          case "__VERIFIER_error" | "reach_error" => {
-            assertProperty(false, srcInfo)
-            pushVal(CCFormula(true, CCInt(), srcInfo))
-          }
-          case name => {
-            outputClause
-            handleFunction(name, initPred, 0)
-          }
-        }
-      }
-
-      case exp : Efunkpar => 
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        (printer print exp.exp_) match {
-          case "assert" | "static_assert" | "__VERIFIER_assert"
-                          if (exp.listexp_.size == 1) => {
-            withoutSideEffects(eval(exp.listexp_.head)) match {
-              case f@CCFormula(IAtom(_, _), _, srcInfo) =>
-                // todo: why atomicEval fails for uninterpreted predicate hints?
-                assertProperty(eval(exp.listexp_.head).toFormula, srcInfo)
-              case f =>
-                assertProperty(atomicEval(exp.listexp_.head).toFormula, srcInfo)
-            }
-            pushVal(CCFormula(true, CCInt(), srcInfo))
-          }
-        case "assume" | "__VERIFIER_assume"
-                          if (exp.listexp_.size == 1) => {
-            withoutSideEffects(eval(exp.listexp_.head)) match {
-              case f@CCFormula(IAtom(_, _), _, _) =>
-                // todo: why atomicEval fails for uninterpreted predicate hints?
-                addGuard(eval(exp.listexp_.head).toFormula)
-              case f =>
-                addGuard(atomicEval(exp.listexp_.head).toFormula)
-            }
-            pushVal(CCFormula(true, CCInt(), srcInfo))
-        }
-        case cmd@("chan_send" | "chan_receive") if (exp.listexp_.size == 1) => {
-          val name = printer print exp.listexp_.head
-          (channels get name) match {
-            case Some(chan) => {
-              val sync = cmd match {
-                case "chan_send"    => ParametricEncoder.Send(chan)
-                case "chan_receive" => ParametricEncoder.Receive(chan)
+                    newTerm
+                  } else {
+                    val ind = values.indexWhere(v => v == topVal)
+                    assert(ind > -1 && ind < values.size - 1) // todo
+                    val ptr = CCStackPointer(ind, popVal.typ, Nil)
+                    CCTerm(IExpression.Int2ITerm(ind), ptr, srcInfo)
+                  }
+                  pushVal(t) //we don't care about the value
               }
-              outputClause(newPred(Nil, None).pred, sync)
+            case _ : Indirection =>
+              val v = popVal
+              v.typ match { // todo: type checking?
+                case ptr : CCStackPointer => pushVal(getPointedTerm(ptr))
+                case   _ : CCHeapPointer =>
+                  if(evaluatingLhs) pushVal(v)
+                  else pushVal(heapRead(v))
+                case  arr : CCHeapArrayPointer =>
+                  if(evaluatingLhs) pushVal(v)
+                  else pushVal(heapArrayRead(v, CCTerm(IIntLit(0), CCInt(), srcInfo), arr))
+                case _ : CCFunctionPointer =>
+                  // Dereferencing function pointer yields a function designator that is usually
+                  // automatically converted to a function pointer.  We always do the conversion
+                  // and treat the cases where it should not happen as special cases.
+                  convertedFunctionDesignator = true
+                  pushVal(v)
+                case _ => throw new TranslationException("Cannot dereference " +
+                  "non-pointer: " + v.typ + " " + v.toTerm)
+              }
+            case _ : Plus       => // nothing
+            case _ : Negative   =>
+              val t = popVal mapTerm (-(_))
+              pushVal(CCTerm(t.toTerm, t.typ, srcInfo))
+            //          case _ : Complement.  Unary_operator ::= "~" ;
+            case _ : Logicalneg =>
+              pushVal(CCFormula(~popVal.toFormula, CCInt(), srcInfo))
+          }
+        }
+        //      case exp : Ebytesexpr.  Exp15 ::= "sizeof" Exp15;
+        //      case exp : Ebytestype.  Exp15 ::= "sizeof" "(" Type_name ")";
+        //      case exp : Earray.      Exp16 ::= Exp16 "[" Exp "]" ;
+
+        case exp : Efunk => {
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          // inline the called function
+          printer print exp.exp_ match {
+            case "__VERIFIER_error" | "reach_error" => {
+              assertProperty(false, srcInfo)
               pushVal(CCFormula(true, CCInt(), srcInfo))
             }
-            case None =>
-              throw new TranslationException(
-                name + " is not a declared channel")
+            case name => {
+              outputClause
+              handleFunction(name, initPred, 0)
+            }
           }
         }
-        case name@("malloc" | "calloc" | "alloca" | "__builtin_alloca") => { // todo: proper alloca and calloc
-          if (!modelHeap)
-            throw NeedsHeapModelException
-          val (typ, allocSize) = exp.listexp_(0) match {
-            case exp : Ebytestype =>
-              (getType(exp), CCTerm(IIntLit(IdealInt(1)), CCInt(), srcInfo))
-            //case exp : Ebytesexpr => eval(exp.exp_).typ - handled by preprocessor
-            case exp : Etimes =>
-              exp.exp_1 match {
-                case e : Ebytestype =>
-                  (getType(e), eval(exp.exp_2))
-                case e if exp.exp_2.isInstanceOf[Ebytestype] =>
-                  (getType(exp.exp_2.asInstanceOf[Ebytestype]), eval(e))
-                case _ =>
-                  throw new TranslationException(
-                    "Unsupported alloc expression: " + (printer print exp))
+
+        case exp : Efunkpar =>
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          (printer print exp.exp_) match {
+            case "assert" | "static_assert" | "__VERIFIER_assert"
+              if (exp.listexp_.size == 1) => {
+              withoutSideEffects(eval(exp.listexp_.head)) match {
+                case f@CCFormula(IAtom(_, _), _, srcInfo) =>
+                  // todo: why atomicEval fails for uninterpreted predicate hints?
+                  assertProperty(eval(exp.listexp_.head).toFormula, srcInfo)
+                case f =>
+                  assertProperty(atomicEval(exp.listexp_.head).toFormula, srcInfo)
               }
-            //case exp : Evar => // allocation in bytes
+              pushVal(CCFormula(true, CCInt(), srcInfo))
+            }
+            case "assume" | "__VERIFIER_assume"
+              if (exp.listexp_.size == 1) => {
+              withoutSideEffects(eval(exp.listexp_.head)) match {
+                case f@CCFormula(IAtom(_, _), _, _) =>
+                  // todo: why atomicEval fails for uninterpreted predicate hints?
+                  addGuard(eval(exp.listexp_.head).toFormula)
+                case f =>
+                  addGuard(atomicEval(exp.listexp_.head).toFormula)
+              }
+              pushVal(CCFormula(true, CCInt(), srcInfo))
+            }
+            case cmd@("chan_send" | "chan_receive") if (exp.listexp_.size == 1) => {
+              val name = printer print exp.listexp_.head
+              (channels get name) match {
+                case Some(chan) => {
+                  val sync = cmd match {
+                    case "chan_send"    => ParametricEncoder.Send(chan)
+                    case "chan_receive" => ParametricEncoder.Receive(chan)
+                  }
+                  outputClause(newPred(Nil, None).pred, sync)
+                  pushVal(CCFormula(true, CCInt(), srcInfo))
+                }
+                case None =>
+                  throw new TranslationException(
+                    name + " is not a declared channel")
+              }
+            }
+            case name@("malloc" | "calloc" | "alloca" | "__builtin_alloca") => { // todo: proper alloca and calloc
+              if (!modelHeap)
+                throw NeedsHeapModelException
+              val (typ, allocSize) = exp.listexp_(0) match {
+                case exp : Ebytestype =>
+                  (getType(exp), CCTerm(IIntLit(IdealInt(1)), CCInt(), srcInfo))
+                //case exp : Ebytesexpr => eval(exp.exp_).typ - handled by preprocessor
+                case exp : Etimes =>
+                  exp.exp_1 match {
+                    case e : Ebytestype =>
+                      (getType(e), eval(exp.exp_2))
+                    case e if exp.exp_2.isInstanceOf[Ebytestype] =>
+                      (getType(exp.exp_2.asInstanceOf[Ebytestype]), eval(e))
+                    case _ =>
+                      throw new TranslationException(
+                        "Unsupported alloc expression: " + (printer print exp))
+                  }
+                //case exp : Evar => // allocation in bytes
 
-            case _ => throw new TranslationException(
-              "Unsupported alloc expression: " + (printer print exp))
-          }
+                case _ => throw new TranslationException(
+                  "Unsupported alloc expression: " + (printer print exp))
+              }
 
-          val arrayType = name match {
-            case "malloc" | "calloc"           => HeapArray
-            case "alloca" | "__builtin_alloca" => StackArray
-          }
-          val objectTerm = CCTerm(name match {
-            case "calloc"                                 => typ.getZeroInit
-            case "malloc" | "alloca" | "__builtin_alloca" => typ.getNonDet
-          }, typ, srcInfo)
+              val arrayType = name match {
+                case "malloc" | "calloc"           => HeapArray
+                case "alloca" | "__builtin_alloca" => StackArray
+              }
+              val objectTerm = CCTerm(name match {
+                case "calloc"                                 => typ.getZeroInit
+                case "malloc" | "alloca" | "__builtin_alloca" => typ.getNonDet
+              }, typ, srcInfo)
 
-          allocSize match {
-            case CCTerm(IIntLit(IdealInt(1)), typ, srcInfo)
-              if typ.isInstanceOf[CCArithType] && !lhsIsArrayPointer =>
-              pushVal(heapAlloc(objectTerm))
-            case CCTerm(sizeExp, typ, srcInfo) if typ.isInstanceOf[CCArithType] =>
-              val addressRangeValue = heapBatchAlloc(objectTerm, sizeExp)
-//              localVars.incrementLastFrame
-              // todo: values addGuard ?
-              pushVal(CCTerm(addressRangeValue, CCHeapArrayPointer(heap, typ, arrayType), srcInfo))
-            // case CCTerm(IIntLit(IdealInt(n)), CCInt) =>
+              allocSize match {
+                case CCTerm(IIntLit(IdealInt(1)), typ, srcInfo)
+                  if typ.isInstanceOf[CCArithType] && !lhsIsArrayPointer =>
+                  pushVal(heapAlloc(objectTerm))
+                case CCTerm(sizeExp, typ, srcInfo) if typ.isInstanceOf[CCArithType] =>
+                  val addressRangeValue = heapBatchAlloc(objectTerm, sizeExp)
+                  //              localVars.incrementLastFrame
+                  // todo: values addGuard ?
+                  pushVal(CCTerm(addressRangeValue, CCHeapArrayPointer(heap, typ, arrayType), srcInfo))
+                // case CCTerm(IIntLit(IdealInt(n)), CCInt) =>
                 // todo: optimise constant size allocations > 1?
+              }
+            }
+            case "realloc" =>
+              if (!modelHeap)
+                throw NeedsHeapModelException
+              throw new TranslationException("realloc is not supported.")
+            case "free" => // todo: what about trying to free unallocated or already freed addresses?
+              if (!modelHeap)
+                throw NeedsHeapModelException
+              val t = atomicEval(exp.listexp_.head)
+              heapFree(t)
+              pushVal(CCTerm(0, CCVoid(), srcInfo)) // free returns no value, pushing dummy
+            case name => {
+              // then we inline the called function
+
+              // evaluate the arguments
+              // todo: if we are to handle a function contract, arguments are handled
+              // as heap pointers. if the function is to be inlined, then arguments
+              // are handled as stack pointers. here we set a flag to notify this
+              handlingFunContractArgs = functionContexts.contains(name)
+              for (e <- exp.listexp_)
+                evalHelp(e)
+              if(!handlingFunContractArgs) outputClause
+              handlingFunContractArgs = false
+
+              val functionEntry = initPred
+
+              handleFunction(name, functionEntry, exp.listexp_.size)
+            }
           }
-        }
-        case "realloc" =>
-          if (!modelHeap)
-            throw NeedsHeapModelException
-          throw new TranslationException("realloc is not supported.")
-        case "free" => // todo: what about trying to free unallocated or already freed addresses?
-          if (!modelHeap)
-            throw NeedsHeapModelException
-          val t = atomicEval(exp.listexp_.head)
-          heapFree(t)
-          pushVal(CCTerm(0, CCVoid(), srcInfo)) // free returns no value, pushing dummy
-        case name => {
-          // then we inline the called function
 
-          // evaluate the arguments
-          // todo: if we are to handle a function contract, arguments are handled
-          // as heap pointers. if the function is to be inlined, then arguments
-          // are handled as stack pointers. here we set a flag to notify this
-          handlingFunContractArgs = functionContexts.contains(name)
-          for (e <- exp.listexp_)
-            evalHelp(e)
-          if(!handlingFunContractArgs) outputClause
-          handlingFunContractArgs = false
-
-          val functionEntry = initPred
-
-          handleFunction(name, functionEntry, exp.listexp_.size)
-        }
-      }
-
-      case exp : Eselect => {
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        val evaluatingLhs_pre = evaluatingLhs
-        evaluatingLhs = false
-        val subexpr = eval(exp.exp_)
-        evaluatingLhs = evaluatingLhs_pre
-        val fieldName = exp.cident_
-        subexpr.typ match {
-          case structType : CCStruct => { // todo a better way
-            if(!structType.contains(fieldName))
-              throw new TranslationException(fieldName + " is not a member of "
-                + structType + "!")
-            val ind = structType.getFieldIndex(fieldName)
-            val fieldType = structType.getFieldType(ind) /*match {
+        case exp : Eselect => {
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          val evaluatingLhs_pre = evaluatingLhs
+          evaluatingLhs = false
+          val subexpr = eval(exp.exp_)
+          evaluatingLhs = evaluatingLhs_pre
+          val fieldName = exp.cident_
+          subexpr.typ match {
+            case structType : CCStruct => { // todo a better way
+              if(!structType.contains(fieldName))
+                throw new TranslationException(fieldName + " is not a member of "
+                  + structType + "!")
+              val ind = structType.getFieldIndex(fieldName)
+              val fieldType = structType.getFieldType(ind) /*match {
               case declPtr : CCDeclarationOnlyPointer if !evaluatingLhs =>
                 getHeapPointer (declPtr)
               case typ => typ
             }*/
-            val sel = structType.getADTSelector(ind)
-            pushVal(CCTerm(sel(subexpr.toTerm), fieldType, srcInfo))
-          }
-          case _ =>
-            throw new TranslationException("Trying to access field '." +
-              fieldName + "' of a variable which is not a struct.")
-        }
-      }
-
-      case exp : Epoint => {
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        val evaluatingLhs_pre = evaluatingLhs
-        evaluatingLhs = false
-        val subexpr = eval(exp.exp_)
-        evaluatingLhs = evaluatingLhs_pre
-        val fieldName = exp.cident_
-        val term = subexpr.typ match {
-          case ptrType : CCStackPointer => getPointedTerm(ptrType)
-          case _ : CCHeapPointer =>  //todo: error here if field is null
-            heapRead(subexpr)
-          case _ => throw new TranslationException(
-            "Trying to access field '->" + fieldName + "' of non pointer.")
-        }
-        val structType = term.typ match {
-          case typ : CCStruct => typ
-          case CCStructField(name, structs) => structs(name)
-          case typ => throw new TranslationException("Epoint is currently " +
-            "only implemented for structs, not " + typ + ": " +
-            (printer print exp))
-        }
-        if(!structType.contains(fieldName))
-          throw new TranslationException(fieldName + " is not a member of "
-            + structType + "!")
-        val ind = structType.getFieldIndex(fieldName)
-        val fieldType = structType.getFieldType(ind)
-        val sel = structType.getADTSelector(ind)
-        pushVal(CCTerm(sel(term.toTerm), fieldType, srcInfo))
-      }
-
-      case _ : Epostinc | _ : Epostdec=>
-        val (postExp, op) = exp match {
-          case exp : Epostinc => (exp.exp_, +1)
-          case exp : Epostdec => (exp.exp_, -1)
-        }
-        evalHelp(postExp)
-        val evalExp = topVal
-        maybeOutputClause
-        if(isHeapPointer(postExp)) {
-          heapWrite(evalExp.toTerm.asInstanceOf[IFunApp], topVal.mapTerm(_ + op),
-            assertMemSafety = true,
-            assumeMemSafety = true)
-        } else {
-          setValue(lookupVar(asLValue(postExp)),
-            getActualAssignedTerm(evalExp, topVal.mapTerm(_ + op)),
-            isIndirection(postExp)) // todo get rid of indirection?
-        }
-
-      case exp : Evar => {
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        val name = exp.cident_
-        pushVal(lookupVarNoException(name) match {
-          case -1 =>
-            val enumeratorDef = enumeratorDefs get name
-            val functionId = functionIds get name
-            (enumeratorDef, functionId) match {
-              case (_, Some(t)) => CCTerm(t, CCFunctionPointer(), srcInfo)
-              case (Some(e), _) => e
-              case (None, None) => throw new TranslationException(
-                getLineString(exp) + "Symbol " + name + " is not declared")
+              val sel = structType.getADTSelector(ind)
+              pushVal(CCTerm(sel(subexpr.toTerm), fieldType, srcInfo))
             }
-          case ind =>
-            getValue(ind, false)
-        })
-      }
-
-      case exp : Econst => evalHelp(exp.constant_)
-      case exp : Estring => // todo: implement this properly
-        warn("ignoring string argument")
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        pushVal(CCTerm(IIntLit(IdealInt(1)), CCInt(), srcInfo))
-
-      case exp : Earray =>
-        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-        val arrayTerm : CCExpr = eval(exp.exp_1)
-        val index : CCExpr = eval(exp.exp_2)
-
-        import IExpression._
-        arrayTerm.typ match {
-          case array : CCHeapArrayPointer =>
-            pushVal(heapArrayRead(arrayTerm, index, array))
-          case array : CCArray => // todo: move to separate method
-            val readValue = CCTerm(array.arraySort.
-              select(arrayTerm.toTerm, index.toTerm), array.elementType, srcInfo)
-            assertProperty((index.toTerm >= 0) &&&
-              (index.toTerm < array.sizeExpr.toTerm), srcInfo)
-            pushVal(readValue)
-          case _ =>
-            throw new TranslationException(getLineString(exp) +
-              arrayTerm + " is not an array type!")
+            case _ =>
+              throw new TranslationException("Trying to access field '." +
+                fieldName + "' of a variable which is not a struct.")
+          }
         }
 
-      case _ =>
-        throw new TranslationException(getLineString(exp) +
-          "Expression currently not supported by TriCera: " +
-          (printer print exp))
+        case exp : Epoint => {
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          val evaluatingLhs_pre = evaluatingLhs
+          evaluatingLhs = false
+          val subexpr = eval(exp.exp_)
+          evaluatingLhs = evaluatingLhs_pre
+          val fieldName = exp.cident_
+          val term = subexpr.typ match {
+            case ptrType : CCStackPointer => getPointedTerm(ptrType)
+            case _ : CCHeapPointer =>  //todo: error here if field is null
+              heapRead(subexpr)
+            case _ => throw new TranslationException(
+              "Trying to access field '->" + fieldName + "' of non pointer.")
+          }
+          val structType = term.typ match {
+            case typ : CCStruct => typ
+            case CCStructField(name, structs) => structs(name)
+            case typ => throw new TranslationException("Epoint is currently " +
+              "only implemented for structs, not " + typ + ": " +
+              (printer print exp))
+          }
+          if(!structType.contains(fieldName))
+            throw new TranslationException(fieldName + " is not a member of "
+              + structType + "!")
+          val ind = structType.getFieldIndex(fieldName)
+          val fieldType = structType.getFieldType(ind)
+          val sel = structType.getADTSelector(ind)
+          pushVal(CCTerm(sel(term.toTerm), fieldType, srcInfo))
+        }
+
+        case _ : Epostinc | _ : Epostdec=>
+          val (postExp, op) = exp match {
+            case exp : Epostinc => (exp.exp_, +1)
+            case exp : Epostdec => (exp.exp_, -1)
+          }
+          evalHelp(postExp)
+          val evalExp = topVal
+          maybeOutputClause
+          if(isHeapPointer(postExp)) {
+            heapWrite(evalExp.toTerm.asInstanceOf[IFunApp], topVal.mapTerm(_ + op),
+              assertMemSafety = true,
+              assumeMemSafety = true)
+          } else {
+            setValue(lookupVar(asLValue(postExp)),
+              getActualAssignedTerm(evalExp, topVal.mapTerm(_ + op)),
+              isIndirection(postExp)) // todo get rid of indirection?
+          }
+
+        case exp : Evar => {
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          val name = exp.cident_
+          pushVal(lookupVarNoException(name) match {
+            case -1 =>
+              val enumeratorDef = enumeratorDefs get name
+              val functionId = functionIds get name
+              (enumeratorDef, functionId) match {
+                case (_, Some(t)) =>
+                  // In this case we have a function designator that is usually automatically
+                  // converted to a function pointer.  We always do the conversion and treat
+                  // the cases where it should not happen as special cases.
+                  convertedFunctionDesignator = true
+                  CCTerm(t, CCFunctionPointer(), srcInfo)
+                case (Some(e), _) => e
+                case (None, None) => throw new TranslationException(
+                  getLineString(exp) + "Symbol " + name + " is not declared")
+              }
+            case ind =>
+              getValue(ind, false)
+          })
+        }
+
+        case exp : Econst => evalHelp(exp.constant_)
+        case exp : Estring => // todo: implement this properly
+          warn("ignoring string argument")
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          pushVal(CCTerm(IIntLit(IdealInt(1)), CCInt(), srcInfo))
+
+        case exp : Earray =>
+          val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
+          val arrayTerm : CCExpr = eval(exp.exp_1)
+          val index : CCExpr = eval(exp.exp_2)
+
+          import IExpression._
+          arrayTerm.typ match {
+            case array : CCHeapArrayPointer =>
+              pushVal(heapArrayRead(arrayTerm, index, array))
+            case array : CCArray => // todo: move to separate method
+              val readValue = CCTerm(array.arraySort.
+                select(arrayTerm.toTerm, index.toTerm), array.elementType, srcInfo)
+              assertProperty((index.toTerm >= 0) &&&
+                (index.toTerm < array.sizeExpr.toTerm), srcInfo)
+              pushVal(readValue)
+            case _ =>
+              throw new TranslationException(getLineString(exp) +
+                arrayTerm + " is not an array type!")
+          }
+
+        case _ =>
+          throw new TranslationException(getLineString(exp) +
+            "Expression currently not supported by TriCera: " +
+            (printer print exp))
+      }
+      convertedFunctionDesignator
     }
 
     private def handleFunction(name : String,
