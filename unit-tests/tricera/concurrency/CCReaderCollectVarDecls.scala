@@ -103,4 +103,13 @@ class CCReaderCollectVarDecls extends AnyFlatSpec {
           HeapArrayType.GlobalArray)))
   }
 
+  "The type of int (*fp)()" should "be function pointer" in {
+    assert(testCollectVarDeclsNoInit("int (*fp)();", isGlobal = true,
+      expected = CCFunctionPointer()))
+  }
+
+  "The type of int (*add)(int x, int[] x)" should "be function pointer" in {
+    assert(testCollectVarDeclsNoInit("int (*add)(int x, int x);", isGlobal = true,
+      expected = CCFunctionPointer()))
+  }
 }

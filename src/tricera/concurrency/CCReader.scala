@@ -450,6 +450,16 @@ object CCReader {
     def shortName = name
   }
 
+  // CCFunctionPointer does not derive from CCPointer as it does not point to a CCType.
+  // CCFunction is not implemented as toSort cannot be defined for it.
+  // (Without adding support for function designators in the output.)
+  case class CCFunctionPointer()(implicit arithmeticMode: ArithmeticMode.Value)
+    extends CCType(arithmeticMode) {
+    def shortName = "func-ptr"
+
+    override def toString: String = "function pointer"
+  }
+
   abstract sealed class CCPointer(typ : CCType)
                                  (implicit arithmeticMode : ArithmeticMode.Value)
     extends CCType(arithmeticMode) {
@@ -774,6 +784,8 @@ class CCReader private (prog : Program,
 
   private val channels = new MHashMap[String, ParametricEncoder.CommChannel]
 
+  // functionIds contains an ITerm wih an unique id for each function
+  private val functionIds = new MHashMap[String, ITerm]
   private val functionDefs  = new MHashMap[String, Function_def]
   private val functionExitPreds = new MHashMap[String, CCPredicate]
   private val functionDecls = new MHashMap[String, (Direct_declarator, CCType)]
@@ -1175,6 +1187,11 @@ class CCReader private (prog : Program,
         case _ =>
           // nothing
       }
+
+    // assign one unique integer to each function name
+    val functionNamesIterator = functionDecls.keys.toIterator ++ functionDefs.keys.toIterator
+    for ((functionName, id) <- functionNamesIterator.zipWithIndex)
+      functionIds.put(functionName, IIntLit(IdealInt(id)))
 
     // prevent time variables and heap variable from being initialised twice
     globalVars.inits ++= (globalVarSymex.getValues drop
@@ -1628,8 +1645,28 @@ class CCReader private (prog : Program,
           directDecl match {
             // function declaration
             case _: NewFuncDec /* | _ : OldFuncDef */ | _: OldFuncDec =>
-              CCFunctionDeclaration(name, typeWithPtrs, directDecl,
-                initDeclWrapper.sourceInfo) // todo: check that typeWithPtrs is correct here
+              val calleeDecl = directDecl match {
+                case f: NewFuncDec => f.direct_declarator_
+                case f: OldFuncDec => f.direct_declarator_
+              }
+              // todo func-ptr: consider adding support for more types of declarations, function pointer pointer for example
+              calleeDecl match {
+                case parenDecl: ParenDecl =>
+                  parenDecl.declarator_ match {
+                    case beginPointer: BeginPointer =>
+                      (beginPointer.pointer_, beginPointer.direct_declarator_) match {
+                        case (_: Point, name: Name) =>
+                          CCVarDeclaration(name.cident_, CCFunctionPointer(), initDeclWrapper.maybeInitializer,
+                            initDeclWrapper.hints, isArray = false, needsHeap = false,
+                            initArrayExpr = None, srcInfo = initDeclWrapper.sourceInfo)
+                        case _ => throw new TranslationException("Unsupported declaration.")
+                      }
+                    case _ => throw new TranslationException("Unsupported declaration.")
+                  }
+                case _ =>
+                  CCFunctionDeclaration(name, typeWithPtrs, directDecl,
+                    initDeclWrapper.sourceInfo) // todo: check that typeWithPtrs is correct here
+              }
             // array declaration
             case _: InitArray | _: Incomplete =>
               val (arrayType, initArrayExpr) = {
@@ -3543,12 +3580,16 @@ class CCReader private (prog : Program,
         }
 
       case exp : Evar => {
+        val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
         val name = exp.cident_
         pushVal(lookupVarNoException(name) match {
           case -1 =>
-            (enumeratorDefs get name) match {
-              case Some(e) => e
-              case None => throw new TranslationException(
+            val enumeratorDef = enumeratorDefs get name
+            val functionId = functionIds get name
+            (enumeratorDef, functionId) match {
+              case (_, Some(t)) => CCTerm(t, CCFunctionPointer(), srcInfo)
+              case (Some(e), _) => e
+              case (None, None) => throw new TranslationException(
                 getLineString(exp) + "Symbol " + name + " is not declared")
             }
           case ind =>
