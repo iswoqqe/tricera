@@ -1,0 +1,15 @@
+#!/bin/sh
+
+LAZABS=../../tri
+
+TESTS="parse_variables.c\
+       equality.c\
+       inequality.c\
+       evaluate_address_and_indirection.c"
+
+for name in $TESTS; do
+    echo
+    echo $name
+    $LAZABS "$@" $name 2>&1 | grep -v 'at '
+done
+
