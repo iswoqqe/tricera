@@ -3709,7 +3709,7 @@ class CCReader private (prog : Program,
         handlingFunContractArgs = functionContexts.contains(name)
         for (e <- argExprs)
           evalHelp(e)
-        if (!handlingFunContractArgs) outputClause
+        outputClause
         handlingFunContractArgs = false
         // call the function and ensure that the result return value is in postCall
         handleFunction(name, initPred, argNum)
