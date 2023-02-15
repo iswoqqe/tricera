@@ -3637,6 +3637,18 @@ class CCReader private (prog : Program,
       convertedFunctionDesignator
     }
 
+    private def parameterListIsVoid(decl: NewFuncDec) = {
+      val parameterList = decl.parameter_type_.asInstanceOf[AllSpec].listparameter_declaration_
+      parameterList.get(0) match {
+        case t : OnlyType =>
+          t.listdeclaration_specifier_.get(0) match {
+            case t : Type => t.type_specifier_.isInstanceOf[Tvoid]
+            case _ => false
+          }
+        case _ => false
+      }
+    }
+
     private def getNumArgsForFunction(name : String) : Option[Int] = {
       val functionDef = functionDefs get name
       val functionDecl = functionDecls get name
@@ -3650,6 +3662,8 @@ class CCReader private (prog : Program,
         case _ => None
       }
       directDecl match {
+        case Some(d : NewFuncDec) if parameterListIsVoid(d) =>
+          Some(0)
         case Some(d : NewFuncDec) =>
           Some(d.parameter_type_.asInstanceOf[AllSpec].listparameter_declaration_.size)
         case Some(d : OldFuncDec) =>
