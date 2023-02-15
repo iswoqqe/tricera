@@ -41,7 +41,7 @@ import lazabs.horn.abstractions.VerificationHints.{VerifHintElement, VerifHintIn
 import lazabs.horn.bottomup.HornClauses
 import IExpression.{ConstantTerm, Predicate, Sort, toFunApplier}
 
-import scala.collection.mutable.{ArrayBuffer, Buffer, Stack, HashMap => MHashMap, 
+import scala.collection.mutable.{ArrayBuffer, Buffer, Stack, HashMap => MHashMap,
                                  HashSet => MHashSet}
 
 import tricera.Util._
@@ -3397,9 +3397,8 @@ class CCReader private (prog : Program,
               assertProperty(false, srcInfo)
               pushVal(CCFormula(true, CCInt(), srcInfo))
             }
-            case name => {
-              outputClause
-              handleFunction(name, initPred, 0)
+            case _ => {
+              handleFunctionPointer(exp.exp_, new ListExp(), srcInfo)
             }
           }
         }
@@ -3500,22 +3499,9 @@ class CCReader private (prog : Program,
               val t = atomicEval(exp.listexp_.head)
               heapFree(t)
               pushVal(CCTerm(0, CCVoid(), srcInfo)) // free returns no value, pushing dummy
-            case name => {
-              // then we inline the called function
-
-              // evaluate the arguments
-              // todo: if we are to handle a function contract, arguments are handled
-              // as heap pointers. if the function is to be inlined, then arguments
-              // are handled as stack pointers. here we set a flag to notify this
-              handlingFunContractArgs = functionContexts.contains(name)
-              for (e <- exp.listexp_)
-                evalHelp(e)
-              if(!handlingFunContractArgs) outputClause
-              handlingFunContractArgs = false
-
-              val functionEntry = initPred
-
-              handleFunction(name, functionEntry, exp.listexp_.size)
+            case _ => {
+              // generate clauses for function call
+              handleFunctionPointer(exp.exp_, exp.listexp_, srcInfo)
             }
           }
 
@@ -3651,6 +3637,75 @@ class CCReader private (prog : Program,
       convertedFunctionDesignator
     }
 
+    private def getNumArgsForFunction(name : String) : Option[Int] = {
+      val functionDef = functionDefs get name
+      val functionDecl = functionDecls get name
+      val directDecl = (functionDef, functionDecl) match {
+        case (Some(d), _) =>
+          Some(FuncDef(d).decl match {
+            case d : BeginPointer => d.direct_declarator_
+            case d : NoPointer => d.direct_declarator_
+          })
+        case (_, Some((d, _))) => Some(d)
+        case _ => None
+      }
+      directDecl match {
+        case Some(d : NewFuncDec) =>
+          Some(d.parameter_type_.asInstanceOf[AllSpec].listparameter_declaration_.size)
+        case Some(d : OldFuncDec) =>
+          Some(0)
+        case _ => None
+      }
+    }
+    private def getPossibleCalleesWithGuards(calleeExpr : CCExpr, argNum : Int) : Iterable[(String, IFormula)] = {
+      functionIds.filter(_ match {
+        case (name, _) => name != entryFunction
+      }).filter(_ match{
+        case (name, _) =>
+          getNumArgsForFunction(name) match {
+            case Some(num) =>
+              num == argNum
+            case None => false
+          }
+      }).map(_ match {
+        case (name, id) => (name, calleeExpr.toTerm === id)
+      })
+    }
+
+    private def handleFunctionPointer(calleeExpr : Exp, argExprs : ListExp, srcInfo : Option[SourceInfo]) : Unit = {
+      val argNum = argExprs.size
+      // create predicate representing the state after the function call returns
+      val retVar = new CCVar("fp_call_return", srcInfo, CCInt())
+      val postCall = newPred(Seq(retVar), None)
+      // get all possible callees
+      val evaledCallee = eval(calleeExpr)
+      val calleesWithGuards = getPossibleCalleesWithGuards(evaledCallee, argNum)
+      // ensure that some branch is taken
+      val guards = calleesWithGuards.map(_._2)
+      assertProperty(IExpression.or(guards), srcInfo)
+      // create one branch for each function
+      for ((name, guard) <- calleesWithGuards) {
+        saveState
+        addGuard(guard)
+        // evaluate the arguments, this is done after saveState since restoreState
+        // is not able to increase localVars.size (at the moment when this is implemented)
+        // todo: if we are to handle a function contract, arguments are handled
+        // as heap pointers. if the function is to be inlined, then arguments
+        // are handled as stack pointers. here we set a flag to notify this
+        handlingFunContractArgs = functionContexts.contains(name)
+        for (e <- argExprs)
+          evalHelp(e)
+        if (!handlingFunContractArgs) outputClause
+        handlingFunContractArgs = false
+        // call the function and ensure that the result return value is in postCall
+        handleFunction(name, initPred, argNum)
+        outputClause(postCall)
+        restoreState
+      }
+      // continue generating future clauses from postCall clause
+      pushFormalVal(CCInt())
+      resetFields(postCall.pred)
+    }
     private def handleFunction(name : String,
                                functionEntry : CCPredicate,
                                argNum : Int) =
