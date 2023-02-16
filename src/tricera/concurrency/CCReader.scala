@@ -3672,9 +3672,7 @@ class CCReader private (prog : Program,
       }
     }
     private def getPossibleCalleesWithGuards(calleeExpr : CCExpr, argNum : Int) : Iterable[(String, IFormula)] = {
-      functionIds.filter(_ match {
-        case (name, _) => name != entryFunction
-      }).filter(_ match{
+      functionIds.filter(_ match{
         case (name, _) =>
           getNumArgsForFunction(name) match {
             case Some(num) =>
