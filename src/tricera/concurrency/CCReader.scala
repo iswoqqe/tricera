@@ -3000,10 +3000,19 @@ class CCReader private (prog : Program,
 
     private def evalHelp(exp : Exp) : Unit = evalHelpInner(exp)
 
-    // evalHelpInner returns metadata about the evaluation
-    // currently: returns true iff function designator was converted to pointer
-    private def evalHelpInner(exp : Exp) : Boolean = {
-      var convertedFunctionDesignator = false
+    // convertedFunctionDesignator is true iff the last evaluation converted a
+    // function designator to a function pointer.  This should happen most of
+    // the time but not when the evaluated expression is the operand of &,
+    // sizeof, or _Alignof.  This variable makes it possible to treat these
+    // cases as special cases.
+    // wasJustFunctionDesignator is true iff the last evaluation was just a
+    // function designator and nothing else.  In this case it is possible to
+    // encode function calls in a simpler way.
+    case class EvalHelpInnerReturn(var convertedFunctionDesignator : Boolean = false,
+                                   var wasJustFunctionDesignator : Boolean = false)
+
+    private def evalHelpInner(exp : Exp) : EvalHelpInnerReturn = {
+      val ret = EvalHelpInnerReturn()
 
       exp match {
         case exp : Ecomma => {
@@ -3293,7 +3302,7 @@ class CCReader private (prog : Program,
           }
         case exp : Epreop => {
           val srcInfo = Some(SourceInfo(exp.line_num, exp.col_num, exp.offset))
-          val evaluationConvertedFunctionDesignator = evalHelpInner(exp.exp_)
+          val evalRet = evalHelpInner(exp.exp_)
           exp.unary_operator_ match {
             case _ : Address    =>
               topVal.toTerm match {
@@ -3342,7 +3351,7 @@ class CCReader private (prog : Program,
                   popVal
                   pushVal(t)
 
-                case _ if (topVal.typ.isInstanceOf[CCFunctionPointer] && evaluationConvertedFunctionDesignator) =>
+                case _ if (topVal.typ.isInstanceOf[CCFunctionPointer] && evalRet.convertedFunctionDesignator) =>
                 // do nothing, the conversion has already been done
                 case _ =>
                   val t = if (handlingFunContractArgs) {
@@ -3368,10 +3377,8 @@ class CCReader private (prog : Program,
                   if(evaluatingLhs) pushVal(v)
                   else pushVal(heapArrayRead(v, CCTerm(IIntLit(0), CCInt(), srcInfo), arr))
                 case _ : CCFunctionPointer =>
-                  // Dereferencing function pointer yields a function designator that is usually
-                  // automatically converted to a function pointer.  We always do the conversion
-                  // and treat the cases where it should not happen as special cases.
-                  convertedFunctionDesignator = true
+                  // we automatically convert to a function pointer in this case
+                  ret.convertedFunctionDesignator = true
                   pushVal(v)
                 case _ => throw new TranslationException("Cannot dereference " +
                   "non-pointer: " + v.typ + " " + v.toTerm)
@@ -3398,7 +3405,7 @@ class CCReader private (prog : Program,
               pushVal(CCFormula(true, CCInt(), srcInfo))
             }
             case _ => {
-              handleFunctionPointer(exp.exp_, new ListExp(), srcInfo)
+              evalCall(exp.exp_, new ListExp(), srcInfo)
             }
           }
         }
@@ -3501,7 +3508,7 @@ class CCReader private (prog : Program,
               pushVal(CCTerm(0, CCVoid(), srcInfo)) // free returns no value, pushing dummy
             case _ => {
               // generate clauses for function call
-              handleFunctionPointer(exp.exp_, exp.listexp_, srcInfo)
+              evalCall(exp.exp_, exp.listexp_, srcInfo)
             }
           }
 
@@ -3589,10 +3596,10 @@ class CCReader private (prog : Program,
               val functionId = functionIds get name
               (enumeratorDef, functionId) match {
                 case (_, Some(t)) =>
-                  // In this case we have a function designator that is usually automatically
-                  // converted to a function pointer.  We always do the conversion and treat
-                  // the cases where it should not happen as special cases.
-                  convertedFunctionDesignator = true
+                  // we only have a function designator and nothing else
+                  ret.wasJustFunctionDesignator = true
+                  // we automatically convert to a function pointer in this case
+                  ret.convertedFunctionDesignator = true
                   CCTerm(t, CCFunctionPointer(), srcInfo)
                 case (Some(e), _) => e
                 case (None, None) => throw new TranslationException(
@@ -3634,7 +3641,7 @@ class CCReader private (prog : Program,
             "Expression currently not supported by TriCera: " +
             (printer print exp))
       }
-      convertedFunctionDesignator
+      ret
     }
 
     private def parameterListIsVoid(decl: NewFuncDec) = {
@@ -3684,14 +3691,15 @@ class CCReader private (prog : Program,
       })
     }
 
-    private def handleFunctionPointer(calleeExpr : Exp, argExprs : ListExp, srcInfo : Option[SourceInfo]) : Unit = {
-      val argNum = argExprs.size
+    // evaluates a call f(x, y, z) where the expression f evaluates to a function pointer
+    private def evalFunctionPointerCall(evaledCallee : CCExpr,
+                                        argExprs : ListExp,
+                                        srcInfo : Option[SourceInfo]) : Unit = {
       // create predicate representing the state after the function call returns
       val retVar = new CCVar("fp_call_return", srcInfo, CCInt())
       val postCall = newPred(Seq(retVar), None)
       // get all possible callees
-      val evaledCallee = eval(calleeExpr)
-      val calleesWithGuards = getPossibleCalleesWithGuards(evaledCallee, argNum)
+      val calleesWithGuards = getPossibleCalleesWithGuards(evaledCallee, argExprs.size)
       // ensure that some branch is taken
       val guards = calleesWithGuards.map(_._2)
       assertProperty(IExpression.or(guards), srcInfo)
@@ -3710,13 +3718,43 @@ class CCReader private (prog : Program,
         outputClause
         handlingFunContractArgs = false
         // call the function and ensure that the result return value is in postCall
-        handleFunction(name, initPred, argNum)
+        handleFunction(name, initPred, argExprs.size)
         outputClause(postCall)
         restoreState
       }
       // continue generating future clauses from postCall clause
       pushFormalVal(CCInt())
       resetFields(postCall.pred)
+    }
+
+    // evaluates a call f(x, y, z) where the expression f is just the name of a function
+    private def evalFunctionCall(name: String, argExprs: ListExp): Unit = {
+      // todo: if we are to handle a function contract, arguments are handled
+      // as heap pointers. if the function is to be inlined, then arguments
+      // are handled as stack pointers. here we set a flag to notify this
+      handlingFunContractArgs = functionContexts.contains(name)
+      for (e <- argExprs)
+        evalHelp(e)
+      // This condition makes sure that the encoding is the same as before
+      // function pointer support was added.
+      if (!handlingFunContractArgs || argExprs.size == 0) outputClause
+      handlingFunContractArgs = false
+
+      handleFunction(name, initPred, argExprs.size)
+    }
+
+    // after this returns topVal will be a variable representing the return value of the function call
+    private def evalCall(calleeExpr : Exp, argExprs : ListExp, srcInfo : Option[SourceInfo]) : Unit = {
+      // eval the callee
+      val evalRet = evalHelpInner(calleeExpr)
+      popVal match {
+        case callee if (!callee.typ.isInstanceOf[CCFunctionPointer]) =>
+          throw new TranslationException("Can only call function pointers")
+        case _ if (evalRet.wasJustFunctionDesignator) =>
+          evalFunctionCall(printer print calleeExpr, argExprs)
+        case callee =>
+          evalFunctionPointerCall(callee, argExprs, srcInfo)
+      }
     }
     private def handleFunction(name : String,
                                functionEntry : CCPredicate,
