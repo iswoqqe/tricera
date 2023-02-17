@@ -3745,15 +3745,22 @@ class CCReader private (prog : Program,
 
     // after this returns topVal will be a variable representing the return value of the function call
     private def evalCall(calleeExpr : Exp, argExprs : ListExp, srcInfo : Option[SourceInfo]) : Unit = {
-      // eval the callee
-      val evalRet = evalHelpInner(calleeExpr)
-      popVal match {
-        case callee if (!callee.typ.isInstanceOf[CCFunctionPointer]) =>
-          throw new TranslationException("Can only call function pointers")
-        case _ if (evalRet.wasJustFunctionDesignator) =>
-          evalFunctionCall(printer print calleeExpr, argExprs)
-        case callee =>
-          evalFunctionPointerCall(callee, argExprs, srcInfo)
+      val name = printer print calleeExpr
+      uninterpPredDecls get name match {
+        case Some(predDecl) =>
+          val argTerms : List[ITerm] = for (e <- argExprs.toList) yield eval(e).toTerm
+          pushVal(CCFormula(predDecl(argTerms), CCInt(), srcInfo))
+        case None =>
+          // eval the callee
+          val evalRet = evalHelpInner(calleeExpr)
+          popVal match {
+            case callee if (!callee.typ.isInstanceOf[CCFunctionPointer]) =>
+              throw new TranslationException("Can only call function pointers")
+            case _ if (evalRet.wasJustFunctionDesignator) =>
+              evalFunctionCall(name, argExprs)
+            case callee =>
+              evalFunctionPointerCall(callee, argExprs, srcInfo)
+          }
       }
     }
     private def handleFunction(name : String,
@@ -3803,20 +3810,11 @@ class CCReader private (prog : Program,
           }
         }
         case None => {
-          uninterpPredDecls get name match {
-            case Some(predDecl) =>
-              var argTerms : List[ITerm] = List()
-              for (_ <- 0 until argNum)
-                argTerms = popVal.toTerm :: argTerms
-              pushVal(CCFormula(predDecl(argTerms), CCInt(), None)) // todo:srcInfo
-            case None =>
-              val args =
-                (for (_ <- 0 until argNum) yield popVal.typ).toList.reverse
-              // get rid of the local variables, which are later
-              // replaced with the formal arguments
-              // pointer arguments are saved and passed on
-              callFunctionInlining(name, functionEntry, args)
-          }
+          val args = (for (_ <- 0 until argNum) yield popVal.typ).toList.reverse
+          // get rid of the local variables, which are later
+          // replaced with the formal arguments
+          // pointer arguments are saved and passed on
+          callFunctionInlining(name, functionEntry, args)
         }
       }
 
