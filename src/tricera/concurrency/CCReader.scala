@@ -1353,6 +1353,12 @@ class CCReader private (prog : Program,
       localVars.pushFrame
       val stm = pushArguments(f.function_def_)
 
+      // ensure that the precondition is a superset of the initial state
+      // when we ask the solver to generate a contract for entryFunction
+      val inits = allVarInits
+      if (name == entryFunction && contractFuns.contains(f))
+        output(Clause(atom(prePred, inits), List(), globalPreconditions))
+
       val prePredArgs = allFormalVarTerms.toList
 
       for (v <- functionPostOldArgs(name)) localVars addVar v
@@ -1362,12 +1368,7 @@ class CCReader private (prog : Program,
       val resVar = getResVar(typ)
       val exitPred = newPred(resVar, Some(getLastSourceInfo(funDef.body)))
 
-      // if we ask the solver to generate a contract for main, force the
-      // precondition to be true
-      if (name == entryFunction && contractFuns.contains(f))
-        output(entryPred(prePredArgs ++ prePredArgs) :- true)
-      else
-        output(entryPred(prePredArgs ++ prePredArgs) :- prePred(prePredArgs))
+      output(entryPred(prePredArgs ++ prePredArgs) :- prePred(prePredArgs))
 
       val translator = FunctionTranslator(exitPred)
       val finalPred = typ match {
