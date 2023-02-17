@@ -1362,7 +1362,12 @@ class CCReader private (prog : Program,
       val resVar = getResVar(typ)
       val exitPred = newPred(resVar, Some(getLastSourceInfo(funDef.body)))
 
-      output(entryPred(prePredArgs ++ prePredArgs) :- prePred(prePredArgs))
+      // if we ask the solver to generate a contract for main, force the
+      // precondition to be true
+      if (name == entryFunction && contractFuns.contains(f))
+        output(entryPred(prePredArgs ++ prePredArgs) :- true)
+      else
+        output(entryPred(prePredArgs ++ prePredArgs) :- prePred(prePredArgs))
 
       val translator = FunctionTranslator(exitPred)
       val finalPred = typ match {
