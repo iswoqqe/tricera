@@ -350,7 +350,7 @@ Final:
 -----------------------------------------------
 
 Related assertions: 
- false :- main0(@h, _res2), read(@h, __eval3) != defObj. 
+ false :- main0(@h, _res2), read(@h, __eval4) != defObj. 
 valid-memsafety/valid-memtrack
   expected verdict matches the result!
 
@@ -377,7 +377,7 @@ Final:
 -----------------------------------------------
 
 Related assertions: 
- false :- main0(@h, _res2), read(@h, __eval8) != defObj. 
+ false :- main0(@h, _res2), read(@h, __eval9) != defObj. 
 valid-memsafety/valid-memtrack
   expected verdict matches the result!
 
