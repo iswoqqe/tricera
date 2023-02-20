@@ -2014,8 +2014,9 @@ class CCReader private (prog : Program,
           }
           directDecl match {
             case _: NewFuncDec /* | _ : OldFuncDef */ | _: OldFuncDec =>
-              throw new TranslationException("Functions as struct fields" +
-                " are not supported.")
+              CCFunctionPointer()
+              // throw new TranslationException("Functions as struct fields" +
+              //   " are not supported.")
             case _: Incomplete =>
               if (!modelHeap) throw NeedsHeapModelException
               CCHeapArrayPointer(heap, typ, HeapArray)
@@ -3728,6 +3729,7 @@ class CCReader private (prog : Program,
         outputClause(postCall)
         restoreState
       }
+      // todo func-ptr: do not assume that function returns integer
       // continue generating future clauses from postCall clause
       pushFormalVal(CCInt())
       resetFields(postCall.pred)
