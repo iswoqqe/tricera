@@ -4140,6 +4140,8 @@ class CCReader private (prog : Program,
                   np.direct_declarator_ match {
                     case _ : Incomplete =>
                       CCHeapArrayPointer(heap, typ, HeapArray)
+                    case _ : NewFuncDec | _ : OldFuncDec =>
+                      CCFunctionPointer()
                     case _ => typ
                   }
                 case _ => typ

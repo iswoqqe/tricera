@@ -86,3 +86,6 @@ SAFE
 
 call_struct.c
 SAFE
+
+select_one_min_max.c
+SAFE

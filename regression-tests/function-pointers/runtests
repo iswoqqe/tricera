@@ -13,7 +13,8 @@ TESTS="parse_variables.c\
        call_reassign.c\
        call_contracts.c\
        call_global.c\
-       call_struct.c"
+       call_struct.c\
+       select_one_min_max.c"
 
 for name in $TESTS; do
     echo
