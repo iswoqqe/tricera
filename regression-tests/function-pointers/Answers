@@ -89,3 +89,22 @@ SAFE
 
 select_one_min_max.c
 SAFE
+
+call_uninitialized_pointer.c
+UNSAFE
+
+----------
+Init:
+  main2   
+----------
+    |     
+    |     
+    V     
+ main7(0) 
+----------
+Final:
+ main7(0) 
+----------
+
+Related assertions: 
+ false :- main7(fp:11), fp:11 != 1. (assertion source: line 12) 
